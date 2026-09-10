@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>秒存 — 全平台视频，一键保存到本地</title>
+    <meta
+      name="description"
+      content="粘贴链接即可解析清晰度并下载到手机或电脑。支持主流平台，可选 AI 总结与字幕翻译。"
+    />
+    <link rel="stylesheet" href="/static/css/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark" aria-hidden="true"></span>
+        秒存
+      </a>
+      <button class="menu-btn" type="button" id="menuBtn" aria-label="打开菜单">菜单</button>
+      <nav class="nav" id="nav">
+        <a href="#parse">下载</a>
+        <a href="#platforms">支持平台</a>
+        <a href="#pro">Pro</a>
+      </nav>
+      <button class="btn-pro" type="button" data-open-pro>升级 Pro</button>
+    </header>
+
+    <main>
+      <section class="hero" id="parse">
+        <p class="eyebrow">免费解析 · 手机电脑都能下</p>
+        <h1>全平台视频，<span>一键保存</span>到本地</h1>
+        <p class="sub">
+          不受平台下载入口限制，清晰度自己选。适合把有权保存的课程和资料随时存走。
+        </p>
+        <form class="parse-bar" id="parseForm">
+          <input
+            id="urlInput"
+            type="url"
+            name="url"
+            autocomplete="off"
+            placeholder="粘贴 B 站 / YouTube / 抖音等视频链接"
+            required
+          />
+          <button type="submit" id="parseBtn">免费解析</button>
+        </form>
+        <p class="hint" id="parseHint" hidden></p>
+      </section>
+
+      <section class="workbench" id="workbench" hidden>
+        <div id="playlistPanel" class="playlist" hidden></div>
+        <article class="result" id="resultPanel" hidden>
+          <div class="result-cover">
+            <img id="thumb" alt="视频封面" referrerpolicy="no-referrer" />
+          </div>
+          <div class="result-body">
+            <p class="result-meta" id="resultMeta"></p>
+            <h2 id="resultTitle"></h2>
+            <p class="formats-label">选择清晰度</p>
+            <div class="chips" id="formatChips"></div>
+            <div class="result-actions">
+              <button class="btn-primary" type="button" id="downloadBtn">下载到本地</button>
+              <button class="btn-ghost" type="button" id="summaryBtn">
+                AI 总结 <span class="pro-tag">Pro</span>
+              </button>
+              <button class="btn-ghost" type="button" id="translateBtn">
+                字幕翻译 <span class="pro-tag">Pro</span>
+              </button>
+            </div>
+            <div class="progress" id="progressWrap" hidden>
+              <div class="progress-bar"><span id="progressFill"></span></div>
+              <p id="progressText">准备下载…</p>
+            </div>
+            <div class="ai-box" id="aiBox" hidden></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="section" id="platforms">
+        <h2>主流平台，粘贴就能解析</h2>
+        <p class="section-sub">能力来自 yt-dlp，覆盖数千站点。下面这些是同学最常用的入口。</p>
+        <div class="card-grid">
+          <article class="media-card">
+            <div class="media-preview tone-bili">Bilibili</div>
+            <h3>哔哩哔哩</h3>
+            <p class="tags">#课程 • #投稿 • #清晰度自选</p>
+          </article>
+          <article class="media-card">
+            <div class="media-preview tone-yt">YouTube</div>
+            <h3>YouTube</h3>
+            <p class="tags">#公开视频 • #字幕 • #音频提取</p>
+          </article>
+          <article class="media-card">
+            <div class="media-preview tone-dy">Douyin</div>
+            <h3>抖音 / TikTok</h3>
+            <p class="tags">#短视频 • #手机保存 • #去水印尝试</p>
+          </article>
+          <article class="media-card">
+            <div class="media-preview tone-x">X</div>
+            <h3>X / Twitter</h3>
+            <p class="tags">#资讯 • #片段 • #快速存档</p>
+          </article>
+          <article class="media-card">
+            <div class="media-preview tone-ig">IG</div>
+            <h3>Instagram</h3>
+            <p class="tags">#Reels • #资料备份</p>
+          </article>
+          <article class="media-card">
+            <div class="media-preview tone-vimeo">Vimeo</div>
+            <h3>Vimeo 等更多</h3>
+            <p class="tags">#创作 • #演示 • #全平台</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="pro">
+        <h2>需要更强能力时再升级</h2>
+        <p class="section-sub">免费先把视频拿到手。Pro 面向批量、更高清晰度和 AI 学习场景。</p>
+        <div class="price-grid">
+          <article class="price-card">
+            <h3>免费</h3>
+            <p class="price">¥0</p>
+            <ul>
+              <li>单条解析与下载</li>
+              <li>常用清晰度</li>
+              <li>手机浏览器保存</li>
+            </ul>
+            <button class="btn-primary" type="button" onclick="document.getElementById('urlInput').focus()">
+              马上解析
+            </button>
+          </article>
+          <article class="price-card featured">
+            <p class="badge">同学更常用</p>
+            <h3>秒存 Pro</h3>
+            <p class="price">¥12<span>/月</span></p>
+            <ul>
+              <li>4K 与更高画质</li>
+              <li>播放列表批量下载</li>
+              <li>AI 视频总结</li>
+              <li>字幕翻译</li>
+            </ul>
+            <button class="btn-primary" type="button" data-open-pro>查看 Pro 说明</button>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>
+        请仅下载你有权保存的内容（自己的作品、已获授权或许可协议允许保存的内容）。秒存基于
+        yt-dlp，不针对 DRM，也不提供绕过版权保护的能力。
+      </p>
+      <p>秒存第一期 · 本机演示优先</p>
+    </footer>
+
+    <dialog class="modal" id="proModal">
+      <form method="dialog" class="modal-card">
+        <h3>秒存 Pro</h3>
+        <p>
+          第一期本机演示不接真实支付，AI 总结和字幕翻译可以直接试用（需配置
+          LLM_API_KEY）。上线付费后，这里会变成开通入口。
+        </p>
+        <ul>
+          <li>4K / 更高清晰度</li>
+          <li>播放列表批量下载</li>
+          <li>AI 总结与字幕翻译</li>
+        </ul>
+        <button class="btn-primary" value="close">知道了</button>
+      </form>
+    </dialog>
+
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>
