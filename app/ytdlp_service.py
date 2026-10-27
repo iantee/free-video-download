@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -122,16 +123,118 @@ def _browser_tuple(spec: str) -> tuple[str, ...]:
     return (browser,)
 
 
+_COOKIEFILE_CACHE: tuple[str, str] | None = None
+
+
+def _copy_win_shared(src: str, dst: str) -> None:
+    """Copy a file Chrome still has open. shutil.copy hits PermissionError on Windows."""
+    import ctypes
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    share_all = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateFileW(
+        src,
+        generic_read,
+        share_all,
+        None,
+        open_existing,
+        0x80,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value or handle in (0, 0xFFFFFFFF):
+        raise PermissionError(13, "Could not open cookie database", src)
+    try:
+        size = wintypes.LARGE_INTEGER()
+        if not kernel32.GetFileSizeEx(handle, ctypes.byref(size)):
+            raise PermissionError(13, "Could not read cookie database size", src)
+        remaining = int(size.QuadPart)
+        buf = ctypes.create_string_buffer(1024 * 1024)
+        read = wintypes.DWORD()
+        with open(dst, "wb") as out:
+            while remaining > 0:
+                chunk = min(len(buf), remaining)
+                if not kernel32.ReadFile(handle, buf, chunk, ctypes.byref(read), None) or read.value == 0:
+                    break
+                out.write(buf.raw[: read.value])
+                remaining -= read.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _with_unlock_copy(func: Callable[[], Any]) -> Any:
+    """If Chrome locks the SQLite file, retry the copy with Windows share flags."""
+    import yt_dlp.cookies as cookies_mod
+
+    original = cookies_mod.shutil.copy
+
+    def copy_or_share(src, dst, *args, **kwargs):
+        try:
+            return original(src, dst, *args, **kwargs)
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            _copy_win_shared(str(src), str(dst))
+            return dst
+
+    cookies_mod.shutil.copy = copy_or_share
+    try:
+        return func()
+    finally:
+        cookies_mod.shutil.copy = original
+
+
+def _try_browser_cookiefile(spec: str) -> str | None:
+    """Export browser cookies to a Netscape file so later calls do not re-lock Chrome."""
+    global _COOKIEFILE_CACHE
+    if _COOKIEFILE_CACHE and _COOKIEFILE_CACHE[0] == spec and Path(_COOKIEFILE_CACHE[1]).is_file():
+        return _COOKIEFILE_CACHE[1]
+    try:
+        from yt_dlp.cookies import extract_cookies_from_browser
+
+        browser, *rest = _browser_tuple(spec)
+        profile = rest[0] if rest else None
+        jar = _with_unlock_copy(lambda: extract_cookies_from_browser(browser, profile))
+    except Exception:
+        return None
+    if jar is None or len(jar) == 0:
+        return None
+    dest = Path(tempfile.gettempdir()) / "miaocun-browser.cookies.txt"
+    try:
+        jar.save(str(dest))
+    except OSError:
+        return None
+    _COOKIEFILE_CACHE = (spec, str(dest))
+    return str(dest)
+
+
 def _cookie_opt_variants(url: str) -> list[dict[str, Any]]:
-    """Cookie sources to try. Optional; Douyin public videos use the share-page fallback instead."""
+    """Cookie sources to try. Always end with no-cookies so a locked Chrome cannot block parse."""
+    variants: list[dict[str, Any]] = []
     cookiefile = os.getenv("COOKIES_FILE", "").strip()
     if cookiefile:
-        return [{"cookiefile": cookiefile}]
+        variants.append({"cookiefile": cookiefile})
+        variants.append({})
+        return variants
 
     specified = os.getenv("COOKIES_FROM_BROWSER", "").strip()
     if not specified:
         return [{}]
-    return [{"cookiesfrombrowser": _browser_tuple(specified)}]
+
+    exported = _try_browser_cookiefile(specified)
+    if exported:
+        variants.append({"cookiefile": exported})
+    else:
+        seen = {_browser_tuple(specified)[0]}
+        for spec in ("edge", "firefox", "chrome"):
+            if spec in seen:
+                continue
+            seen.add(spec)
+            variants.append({"cookiesfrombrowser": (spec,)})
+    variants.append({})
+    return variants
 
 
 def _is_cookie_lock(exc: Exception) -> bool:
@@ -142,6 +245,21 @@ def _is_cookie_lock(exc: Exception) -> bool:
             "could not copy chrome cookie",
             "failed to load cookies",
             "cookie database",
+        )
+    )
+
+
+def _is_optional_cookie_failure(exc: Exception) -> bool:
+    """Cookie source is optional; missing Firefox profile etc. should fall through."""
+    if _is_cookie_lock(exc) or _needs_fresh_cookies(exc):
+        return True
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "could not find firefox cookies",
+            "could not find safari cookies",
+            "unknown browser",
         )
     )
 
@@ -183,51 +301,122 @@ def _is_precondition_failed(exc: Exception) -> bool:
     return "412" in text or "Precondition Failed" in text
 
 
-def run_ydl(url: str, opts: dict[str, Any], *, download: bool) -> dict[str, Any]:
+_MEDIA_SUFFIXES = {
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".webm",
+    ".mkv",
+    ".opus",
+    ".ogg",
+    ".aac",
+    ".wav",
+    ".flv",
+    ".m4v",
+}
+
+
+def _finished_media(opts: dict[str, Any]) -> Path | None:
+    """A finished media file already on disk. Cookie cleanup must not throw it away."""
+    outtmpl = opts.get("outtmpl")
+    if not isinstance(outtmpl, str) or not outtmpl:
+        return None
+    dest = Path(outtmpl).parent
+    if not dest.is_dir():
+        return None
+    files = []
+    for path in dest.iterdir():
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if ".part" in name or name.endswith(".ytdl") or " frag" in name:
+            continue
+        if path.suffix.lower() not in _MEDIA_SUFFIXES or path.stat().st_size <= 0:
+            continue
+        files.append(path)
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_size)
+
+
+def run_ydl(
+    url: str,
+    opts: dict[str, Any],
+    *,
+    download: bool,
+    allow_cookies: bool = True,
+) -> dict[str, Any]:
+    """Try configured cookies, then the same call with no cookies.
+
+    A locked Chrome must not replace a later logged-out result, and closing
+    YoutubeDL must not discard an extract that already succeeded.
+    """
     last: Exception | None = None
-    cookie_lock: Exception | None = None
+    saw_cookie_lock = False
+    variants = _cookie_opt_variants(url) if allow_cookies else [{}]
     bili_attempts = 3 if _is_bilibili(url) else 1
-    variants = _cookie_opt_variants(url)
     for index, cookie_opts in enumerate(variants):
         attempt_opts = dict(opts)
         attempt_opts.pop("cookiefile", None)
         attempt_opts.pop("cookiesfrombrowser", None)
         attempt_opts.update(cookie_opts)
-        more_browsers = index + 1 < len(variants)
-        with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+        more = index + 1 < len(variants)
+        ydl = yt_dlp.YoutubeDL(attempt_opts)
+        try:
+            info = None
+            variant_error: Exception | None = None
             for attempt in range(bili_attempts):
                 try:
                     info = ydl.extract_info(url.strip(), download=download)
-                    return ydl.sanitize_info(info) if info else {}
+                    variant_error = None
+                    break
                 except UnsupportedError:
                     raise
-                except (DownloadError, ExtractorError) as exc:
-                    last = exc
-                    if _is_cookie_lock(exc):
-                        cookie_lock = exc
-                    if more_browsers and (_is_cookie_lock(exc) or _needs_fresh_cookies(exc)):
-                        break
-                    if attempt + 1 < bili_attempts and _is_precondition_failed(exc):
-                        time.sleep(0.7 * (attempt + 1))
-                        continue
-                    raise cookie_lock or exc
                 except Exception as exc:  # noqa: BLE001
+                    variant_error = exc
                     last = exc
                     if _is_cookie_lock(exc):
-                        cookie_lock = exc
-                    if more_browsers and (_is_cookie_lock(exc) or _needs_fresh_cookies(exc)):
+                        saw_cookie_lock = True
                         break
                     if attempt + 1 < bili_attempts and _is_precondition_failed(exc):
                         time.sleep(0.7 * (attempt + 1))
                         continue
-                    raise cookie_lock or exc
-    raise cookie_lock or last or RuntimeError("yt-dlp failed")
+                    break
+            if info is not None:
+                data = ydl.sanitize_info(info) or {}
+                if saw_cookie_lock and not cookie_opts:
+                    data["_cookies_skipped"] = True
+                return data
+            if variant_error is not None and _is_cookie_lock(variant_error) and _finished_media(attempt_opts):
+                return {"_cookies_skipped": True}
+            if more and cookie_opts:
+                continue
+            raise variant_error or last or RuntimeError("yt-dlp failed")
+        finally:
+            try:
+                ydl.close()
+            except Exception:
+                pass
+    raise last or RuntimeError("yt-dlp failed")
+
+
+def _caption_langs(mapping: Any) -> list[str]:
+    if not isinstance(mapping, dict):
+        return []
+    return [str(lang) for lang in mapping if str(lang).lower() != "danmaku"]
 
 
 def _has_captions(info: dict[str, Any]) -> bool:
-    subs = info.get("subtitles") or {}
-    auto = info.get("automatic_captions") or {}
-    return bool(subs) or bool(auto)
+    return bool(_caption_langs(info.get("subtitles"))) or bool(_caption_langs(info.get("automatic_captions")))
+
+
+def _no_subtitles_message(url: str) -> str:
+    if _is_bilibili(url):
+        return (
+            "该视频没有可提取的字幕。B 站画面上的字经常是硬字幕（烧进画面）；"
+            "CC / AI 字幕需要登录后才能拉取，请在 .env 填写 COOKIES_FROM_BROWSER 或 COOKIES_FILE 后重启。"
+        )
+    return "该视频没有字幕，无法总结/翻译"
 
 
 def _entry_url(entry: dict[str, Any]) -> str | None:
@@ -351,18 +540,26 @@ def _fetch_douyin_share(url: str) -> DouyinShareMedia | None:
 
 
 def _video_payload(info: dict[str, Any]) -> dict[str, Any]:
-    return {
+    skipped = bool(info.pop("_cookies_skipped", False))
+    webpage = info.get("webpage_url") or info.get("original_url") or ""
+    payload = {
         "ok": True,
         "type": "video",
         "title": info.get("title") or "未命名视频",
         "thumbnail": to_proxy_url(_pick_thumbnail(info)),
         "duration": info.get("duration"),
         "uploader": info.get("uploader") or info.get("channel"),
-        "webpage_url": info.get("webpage_url") or info.get("original_url"),
+        "webpage_url": webpage,
         "extractor": info.get("extractor"),
         "has_subtitles": _has_captions(info),
         "formats": simplify_formats(info),
     }
+    if skipped and _is_bilibili(str(webpage)):
+        payload["cookie_warning"] = (
+            "浏览器 Cookie 被锁住，已改为未登录解析。B 站视频可以看；"
+            "CC 字幕可能拉不到。请完全退出浏览器后再试，退出后不要立刻重新打开。"
+        )
+    return payload
 
 
 def parse_url(url: str) -> dict[str, Any]:
@@ -386,13 +583,13 @@ def parse_url(url: str) -> dict[str, Any]:
     if media:
         return _share_video_payload(media)
 
-    opts = base_opts(
-        url,
-        {
-            "skip_download": True,
-            "extract_flat": "in_playlist",
-        },
-    )
+    parse_extra: dict[str, Any] = {
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+    }
+    if _is_bilibili(url):
+        parse_extra["listsubtitles"] = True
+    opts = base_opts(url, parse_extra)
     try:
         info = run_ydl(url, opts, download=False)
     except UnsupportedError as exc:
@@ -400,7 +597,7 @@ def parse_url(url: str) -> dict[str, Any]:
     except (DownloadError, ExtractorError, Exception) as exc:  # noqa: BLE001
         if share_error:
             raise YtdlpError("parse_failed", share_error.message) from exc
-        raise YtdlpError("parse_failed", _friendly_error(exc)) from exc
+        raise YtdlpError("parse_failed", _friendly_error(exc, url)) from exc
 
     if not info:
         raise YtdlpError("parse_failed", "没有解析到视频信息")
@@ -413,22 +610,32 @@ def parse_url(url: str) -> dict[str, Any]:
     return _video_payload(info)
 
 
-def _friendly_error(exc: Exception) -> str:
+def _friendly_error(exc: Exception, url: str = "") -> str:
     text = str(exc).strip() or exc.__class__.__name__
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     text = re.sub(r"\s+", " ", text)
     if "412" in text or "Precondition Failed" in text:
         return "平台拦截了这次解析（HTTP 412）。请确认链接可在浏览器打开后重试。"
     if _is_cookie_lock(exc):
+        if _is_bilibili(url):
+            return (
+                "读不了浏览器 Cookie：Chrome/Edge 正在运行并锁住了文件。"
+                "B 站视频不用关浏览器也能解析；若要拉 CC 字幕，请完全退出浏览器后再试（退出后不要立刻重新打开），"
+                "或把 Cookie 导出成 Netscape 文件后填写 COOKIES_FILE。"
+            )
+        if _is_douyin(url):
+            return (
+                "读不了浏览器 Cookie：Chrome/Edge 正在运行并锁住了文件。"
+                "抖音公开视频一般不需要 Cookie；若仍失败，请换一条能打开的视频链接。"
+            )
         return (
-            "读不了 Chrome/Edge 的 Cookie：浏览器正在运行并锁住了文件。"
-            "请完全退出 Chrome 和 Edge（系统托盘里也不能留进程），用其中一个打开一次抖音，再回到这里解析。"
+            "读不了浏览器 Cookie：Chrome/Edge 正在运行并锁住了文件。"
+            "请完全退出该浏览器后再试，退出后不要立刻重新打开；或改用 COOKIES_FILE。"
         )
     if _needs_fresh_cookies(exc):
-        return (
-            "抖音需要浏览器访问记录（不必登录）。"
-            "请用 Chrome 或 Edge 打开一次抖音，完全退出该浏览器后再解析。"
-        )
+        if _is_douyin(url):
+            return "抖音公开视频一般不需要登录。请换一条能在浏览器打开的视频链接后重试。"
+        return "平台要求更新登录状态。请重新打开对应网站后再试，或改用 COOKIES_FILE。"
     if len(text) > 240:
         text = text[:237] + "..."
     return text
@@ -495,9 +702,9 @@ def _download_direct(
     except UnsupportedError as exc:
         raise YtdlpError("unsupported", "这个链接暂时不支持下载") from exc
     except (DownloadError, ExtractorError) as exc:
-        raise YtdlpError("download_failed", _friendly_error(exc)) from exc
+        raise YtdlpError("download_failed", _friendly_error(exc, media_url)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise YtdlpError("download_failed", _friendly_error(exc)) from exc
+        raise YtdlpError("download_failed", _friendly_error(exc, media_url)) from exc
     output = _find_output(dest)
     if output is None:
         raise YtdlpError("download_failed", "下载完成但没有找到文件")
@@ -510,6 +717,8 @@ def download_url(
     format_expr: str,
     dest: Path,
     on_progress: ProgressCb | None = None,
+    *,
+    allow_cookies: bool = True,
 ) -> tuple[Path, str]:
     if not is_http_url(url):
         raise YtdlpError("invalid_url", "请粘贴以 http 或 https 开头的视频链接")
@@ -555,13 +764,13 @@ def download_url(
     if not audio_only:
         opts["merge_output_format"] = "mp4"
     try:
-        info = run_ydl(url, opts, download=True)
+        info = run_ydl(url, opts, download=True, allow_cookies=allow_cookies)
     except UnsupportedError as exc:
         raise YtdlpError("unsupported", "这个链接暂时不支持下载") from exc
     except (DownloadError, ExtractorError) as exc:
-        raise YtdlpError("download_failed", _friendly_error(exc)) from exc
+        raise YtdlpError("download_failed", _friendly_error(exc, url)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise YtdlpError("download_failed", _friendly_error(exc)) from exc
+        raise YtdlpError("download_failed", _friendly_error(exc, url)) from exc
 
     output = _find_output(dest)
     if output is None:
@@ -574,25 +783,140 @@ def download_url(
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
-def vtt_to_text(content: str) -> str:
-    lines: list[str] = []
+def _parse_vtt_stamp(stamp: str) -> float:
+    raw = (stamp or "").strip().replace(",", ".")
+    if not raw:
+        return 0.0
+    parts = raw.split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, rest = parts
+            seconds, _, frac = rest.partition(".")
+            millis = int((frac + "000")[:3]) if frac else 0
+            return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + millis / 1000
+        if len(parts) == 2:
+            minutes, rest = parts
+            seconds, _, frac = rest.partition(".")
+            millis = int((frac + "000")[:3]) if frac else 0
+            return int(minutes) * 60 + int(seconds) + millis / 1000
+    except ValueError:
+        return 0.0
+    return 0.0
+
+
+def format_cue_label(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def vtt_to_cues(content: str) -> list[dict[str, Any]]:
+    cues: list[dict[str, Any]] = []
+    current_start: float | None = None
+    current_end: float | None = None
+    texts: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_start, current_end, texts
+        if current_start is None:
+            texts = []
+            current_end = None
+            return
+        joined = " ".join(texts).strip()
+        end = current_end if current_end and current_end > current_start else None
+        if joined and cues and cues[-1]["text"] == joined:
+            prev_end = cues[-1].get("end")
+            if end and (prev_end is None or end > prev_end):
+                cues[-1]["end"] = round(end, 3)
+        elif joined:
+            item: dict[str, Any] = {
+                "start": round(current_start, 3),
+                "label": format_cue_label(current_start),
+                "text": joined,
+            }
+            if end:
+                item["end"] = round(end, 3)
+            cues.append(item)
+        current_start = None
+        current_end = None
+        texts = []
+
     for raw in content.splitlines():
         line = raw.strip()
         if not line:
+            flush()
             continue
         if line.startswith(("WEBVTT", "NOTE", "Kind:", "Language:", "STYLE")):
             continue
         if "-->" in line:
+            flush()
+            left, right = line.split("-->", 1)
+            start_raw = left.strip().split()[0]
+            end_raw = right.strip().split()[0] if right.strip() else ""
+            current_start = _parse_vtt_stamp(start_raw)
+            current_end = _parse_vtt_stamp(end_raw) if end_raw else None
+            continue
+        if current_start is None:
             continue
         if line.isdigit():
             continue
-        line = _TAG_RE.sub("", line).strip()
-        if line and (not lines or lines[-1] != line):
-            lines.append(line)
+        cleaned = _TAG_RE.sub("", line).strip()
+        if cleaned:
+            texts.append(cleaned)
+    flush()
+    return cues
+
+
+def vtt_to_text(content: str) -> str:
+    return cues_to_plain_text(vtt_to_cues(content))
+
+
+def _srt_timestamp(seconds: float) -> str:
+    millis = max(0, int(round(float(seconds) * 1000)))
+    hours, rem = divmod(millis, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, ms = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def cues_to_srt(cues: list[dict[str, Any]]) -> str:
+    """SRT with real end times when we have them. Missing ends stop at the next cue."""
+    usable = [cue for cue in cues if str(cue.get("text") or "").strip()]
+    blocks: list[str] = []
+    for index, cue in enumerate(usable):
+        start = float(cue.get("start") or 0)
+        end_raw = cue.get("end")
+        if end_raw is not None and float(end_raw) > start:
+            end = float(end_raw)
+        else:
+            nxt = usable[index + 1] if index + 1 < len(usable) else None
+            if nxt is not None and float(nxt.get("start") or 0) - start > 0.2:
+                gap_end = float(nxt.get("start") or 0)
+                end = gap_end if gap_end - start <= 12 else start + 4
+            else:
+                end = start + 4
+        if end <= start:
+            end = start + 1
+        text = str(cue.get("text") or "").strip()
+        blocks.append(f"{index + 1}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}")
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks) + "\n"
+
+
+def cues_to_plain_text(cues: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for cue in cues:
+        text = str(cue.get("text") or "").strip()
+        if text and (not lines or lines[-1] != text):
+            lines.append(text)
     return "\n".join(lines)
 
 
-def fetch_subtitles(url: str, dest: Path) -> str:
+def fetch_subtitle_cues(url: str, dest: Path) -> list[dict[str, Any]]:
     if not is_http_url(url):
         raise YtdlpError("invalid_url", "请粘贴以 http 或 https 开头的视频链接")
     url = canonicalize_url(url)
@@ -605,7 +929,7 @@ def fetch_subtitles(url: str, dest: Path) -> str:
             "noplaylist": True,
             "writesubtitles": True,
             "writeautomaticsub": True,
-            "subtitleslangs": ["zh-Hans", "zh-CN", "zh", "en", "en-US"],
+            "subtitleslangs": ["zh-Hans", "zh-CN", "zh", "en", "en-US", "all"],
             "subtitlesformat": "vtt",
             "outtmpl": str(dest / "subs"),
         },
@@ -615,13 +939,13 @@ def fetch_subtitles(url: str, dest: Path) -> str:
     except UnsupportedError as exc:
         raise YtdlpError("unsupported", "这个链接暂时不支持") from exc
     except (DownloadError, ExtractorError) as exc:
-        raise YtdlpError("no_subtitles", _friendly_error(exc)) from exc
+        raise YtdlpError("no_subtitles", _friendly_error(exc, url)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise YtdlpError("no_subtitles", _friendly_error(exc)) from exc
+        raise YtdlpError("no_subtitles", _friendly_error(exc, url)) from exc
 
     vtts = list(dest.rglob("*.vtt"))
     if not vtts:
-        raise YtdlpError("no_subtitles", "该视频没有字幕，无法总结/翻译")
+        raise YtdlpError("no_subtitles", _no_subtitles_message(url))
 
     def score(path: Path) -> int:
         name = path.name.lower()
@@ -633,9 +957,16 @@ def fetch_subtitles(url: str, dest: Path) -> str:
 
     for path in sorted(vtts, key=score):
         try:
-            text = vtt_to_text(path.read_text(encoding="utf-8", errors="ignore"))
+            cues = vtt_to_cues(path.read_text(encoding="utf-8", errors="ignore"))
         except OSError:
             continue
-        if text:
-            return text
-    raise YtdlpError("no_subtitles", "该视频没有字幕，无法总结/翻译")
+        if cues:
+            return cues
+    raise YtdlpError("no_subtitles", _no_subtitles_message(url))
+
+
+def fetch_subtitles(url: str, dest: Path) -> str:
+    text = cues_to_plain_text(fetch_subtitle_cues(url, dest))
+    if not text:
+        raise YtdlpError("no_subtitles", _no_subtitles_message(url))
+    return text

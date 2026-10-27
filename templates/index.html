@@ -6,7 +6,7 @@
     <title>秒存 — 全平台视频，一键保存到本地</title>
     <meta
       name="description"
-      content="粘贴链接即可解析清晰度并下载到手机或电脑。支持主流平台，可选 AI 总结与字幕翻译。"
+      content="粘贴链接即可解析清晰度并下载，或只生成长视频学习笔记：大纲、要点、字幕对照与追问。"
     />
     <link rel="stylesheet" href="/static/css/style.css" />
   </head>
@@ -19,6 +19,7 @@
       <button class="menu-btn" type="button" id="menuBtn" aria-label="打开菜单">菜单</button>
       <nav class="nav" id="nav">
         <a href="#parse">下载</a>
+        <a href="#parse">学习</a>
         <a href="#platforms">支持平台</a>
         <a href="#pro">Pro</a>
       </nav>
@@ -27,10 +28,10 @@
 
     <main>
       <section class="hero" id="parse">
-        <p class="eyebrow">免费解析 · 手机电脑都能下</p>
+        <p class="eyebrow">免费解析 · 也可以只出学习笔记</p>
         <h1>全平台视频，<span>一键保存</span>到本地</h1>
         <p class="sub">
-          不受平台下载入口限制，清晰度自己选。适合把有权保存的课程和资料随时存走。
+          不受平台下载入口限制，清晰度自己选。长视频也可以只生成大纲和要点，不必先下载。
         </p>
         <form class="parse-bar" id="parseForm">
           <input
@@ -41,7 +42,10 @@
             placeholder="粘贴 B 站 / YouTube / 抖音等视频链接"
             required
           />
-          <button type="submit" id="parseBtn">免费解析</button>
+          <div class="parse-actions">
+            <button type="submit" id="parseBtn">免费解析</button>
+            <button type="button" class="btn-learn" id="heroLearnBtn">AI 总结</button>
+          </div>
         </form>
         <p class="hint" id="parseHint" hidden></p>
       </section>
@@ -65,6 +69,7 @@
               <button class="btn-ghost" type="button" id="translateBtn">
                 字幕翻译 <span class="pro-tag">Pro</span>
               </button>
+              <button class="btn-ghost" type="button" id="subtitleBtn">下载字幕</button>
             </div>
             <div class="progress" id="progressWrap" hidden>
               <div class="progress-bar"><span id="progressFill"></span></div>
@@ -73,6 +78,32 @@
             <div class="ai-box" id="aiBox" hidden></div>
           </div>
         </article>
+        <section class="learn" id="learnPanel" hidden>
+          <div class="learn-head">
+            <div class="learn-tabs" id="learnTabs">
+              <button type="button" class="active" data-tab="notes">学习笔记</button>
+              <button type="button" data-tab="mind">思维导图</button>
+              <button type="button" data-tab="cues">字幕对照</button>
+              <button type="button" data-tab="ask">追问</button>
+            </div>
+            <div class="learn-tools">
+              <button class="btn-ghost" type="button" id="downloadCueBtn" disabled>下载字幕</button>
+              <button class="btn-ghost" type="button" id="copyMdBtn">复制 Markdown</button>
+              <button class="btn-ghost" type="button" id="exportMdBtn">导出 .md</button>
+            </div>
+          </div>
+          <p class="learn-status" id="learnStatus" hidden></p>
+          <div class="learn-pane" id="notesPane"></div>
+          <div class="learn-pane" id="mindPane" hidden></div>
+          <div class="learn-pane" id="cuesPane" hidden></div>
+          <div class="learn-pane" id="askPane" hidden>
+            <div class="ask-thread" id="askThread"></div>
+            <form class="ask-form" id="askForm">
+              <input id="askInput" type="text" maxlength="500" placeholder="针对这个视频提问，例如：核心结论是什么？" />
+              <button class="btn-primary" type="submit" id="askBtn">提问</button>
+            </form>
+          </div>
+        </section>
       </section>
 
       <section class="section" id="platforms">
@@ -135,8 +166,8 @@
             <ul>
               <li>4K 与更高画质</li>
               <li>播放列表批量下载</li>
-              <li>AI 视频总结</li>
-              <li>字幕翻译</li>
+              <li>AI 视频总结与章节大纲</li>
+              <li>字幕对照、追问与翻译</li>
             </ul>
             <button class="btn-primary" type="button" data-open-pro>查看 Pro 说明</button>
           </article>
@@ -152,17 +183,31 @@
       <p>秒存第一期 · 本机演示优先</p>
     </footer>
 
+    <div class="mind-screen" id="mindScreen" hidden>
+      <div class="mind-screen-bar">
+        <p id="mindScreenTitle">思维导图</p>
+        <div class="mind-screen-tools">
+          <button class="btn-ghost" type="button" id="mindFitBtn">适应屏幕</button>
+          <button class="btn-ghost" type="button" id="mindZoomOutBtn">缩小</button>
+          <button class="btn-ghost" type="button" id="mindZoomInBtn">放大</button>
+          <button class="btn-ghost" type="button" id="mindExportBtn">下载高清图</button>
+          <button class="btn-primary" type="button" id="mindCloseBtn">关闭</button>
+        </div>
+      </div>
+      <div class="mind-viewport" id="mindViewport"></div>
+    </div>
+
     <dialog class="modal" id="proModal">
       <form method="dialog" class="modal-card">
         <h3>秒存 Pro</h3>
         <p>
-          第一期本机演示不接真实支付，AI 总结和字幕翻译可以直接试用（需配置
+          第一期本机演示不接真实支付，AI 学习笔记可以直接试用（需配置
           LLM_API_KEY）。上线付费后，这里会变成开通入口。
         </p>
         <ul>
           <li>4K / 更高清晰度</li>
           <li>播放列表批量下载</li>
-          <li>AI 总结与字幕翻译</li>
+          <li>AI 总结、字幕对照、追问与翻译</li>
         </ul>
         <button class="btn-primary" value="close">知道了</button>
       </form>

@@ -16,16 +16,19 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app import ai_service, jobs, thumbs
+from app import ai_service, jobs, thumbs, whisper_service
 from app.ytdlp_service import (
     YtdlpError,
     canonicalize_url,
+    cues_to_plain_text,
+    cues_to_srt,
     download_url,
-    fetch_subtitles,
+    fetch_subtitle_cues,
     ffmpeg_available,
     is_http_url,
     parse_url,
 )
+from app.whisper_service import WhisperError
 
 load_dotenv()
 
@@ -63,6 +66,7 @@ async def health() -> dict:
         "ok": True,
         "ffmpeg": ffmpeg_available(),
         "llm": ai_service.llm_configured(),
+        "whisper": whisper_service.whisper_available(),
     }
 
 
@@ -165,24 +169,151 @@ async def api_file(job_id: str):
     )
 
 
-async def _subtitle_then_llm(url: str, action: str, target_lang: str = "zh") -> JSONResponse:
-    if not is_http_url(url):
-        return error_response("invalid_url", "请粘贴以 http 或 https 开头的视频链接")
+async def _require_llm() -> JSONResponse | None:
     if not ai_service.llm_configured():
         return error_response(
             "llm_not_configured",
             "还没有配置 LLM_API_KEY，请复制 .env.example 为 .env 后填写",
         )
+    return None
+
+
+def _load_cues(url: str, dest: Path) -> tuple[list, str]:
+    """Prefer platform subtitles. Without them, transcribe the audio.
+
+    A locked browser cookie file is not a summary failure: keep going logged-out,
+    then Whisper when there is no CC track.
+    """
+    try:
+        return fetch_subtitle_cues(url, dest / "subs"), "subtitle"
+    except YtdlpError as exc:
+        if exc.code != "no_subtitles" and "读不了浏览器 Cookie" not in exc.message:
+            raise
+    try:
+        audio_path, _filename = download_url(url, "bestaudio/best", dest / "audio")
+    except YtdlpError as exc:
+        if "读不了浏览器 Cookie" not in exc.message:
+            raise
+        audio_path, _filename = download_url(
+            url, "bestaudio/best", dest / "audio", allow_cookies=False
+        )
+    return whisper_service.transcribe(audio_path), "whisper"
+
+
+@app.post("/api/summary")
+async def api_summary(payload: dict) -> JSONResponse:
+    url = read_url(payload)
+    if not is_http_url(url):
+        return error_response("invalid_url", "请粘贴以 http 或 https 开头的视频链接")
+    blocked = await _require_llm()
+    if blocked:
+        return blocked
+
+    title = str(payload.get("title") or "").strip()
+    job = jobs.create_job()
+    try:
+        cues, source = await run_in_threadpool(_load_cues, url, job["dir"])
+        notes = await run_in_threadpool(ai_service.summarize, cues, title)
+        jobs.update_job(
+            job["id"],
+            status="learn",
+            cues=cues,
+            source=source,
+            title=title,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "learn_id": job["id"],
+                "overview": notes["overview"],
+                "highlights": notes["highlights"],
+                "chapters": notes["chapters"],
+                "cues": notes["cues"],
+                "markdown": notes["markdown"],
+                "source": source,
+            }
+        )
+    except YtdlpError as exc:
+        jobs.schedule_cleanup(job["id"], delay=1)
+        return error_response(exc.code, exc.message)
+    except WhisperError as exc:
+        jobs.schedule_cleanup(job["id"], delay=1)
+        return error_response(exc.code, exc.message)
+    except ai_service.LlmError as exc:
+        jobs.schedule_cleanup(job["id"], delay=1)
+        return error_response(exc.code, exc.message)
+
+
+def _subtitle_payload(learn_id: str) -> dict | None:
+    if not learn_id:
+        return None
+    job = jobs.get_job(learn_id)
+    cues = (job or {}).get("cues") if job else None
+    if not cues:
+        return None
+    srt = cues_to_srt(cues)
+    if not srt.strip():
+        return None
+    return {
+        "ok": True,
+        "source": (job or {}).get("source") or "subtitle",
+        "srt": srt,
+        "cues": cues,
+    }
+
+
+@app.post("/api/subtitles")
+async def api_subtitles(payload: dict) -> JSONResponse:
+    """Subtitle file for the user to keep. Does not call the LLM."""
+    cached = _subtitle_payload(str(payload.get("learn_id") or "").strip())
+    if cached:
+        return JSONResponse(cached)
+
+    url = read_url(payload)
+    if not is_http_url(url):
+        if str(payload.get("learn_id") or "").strip():
+            return error_response("learn_expired", "学习会话已过期，请重新总结，或再下载一次字幕")
+        return error_response("invalid_url", "请粘贴以 http 或 https 开头的视频链接")
 
     job = jobs.create_job()
     try:
-        text = await run_in_threadpool(fetch_subtitles, url, job["dir"])
-        if action == "summary":
-            result = await run_in_threadpool(ai_service.summarize, text)
-        else:
-            result = await run_in_threadpool(ai_service.translate, text, target_lang)
+        cues, source = await run_in_threadpool(_load_cues, url, job["dir"])
+        srt = cues_to_srt(cues)
+        if not srt.strip():
+            return error_response("no_subtitles", "没有可用的字幕文本")
+        return JSONResponse({"ok": True, "source": source, "srt": srt, "cues": cues})
+    except YtdlpError as exc:
+        return error_response(exc.code, exc.message)
+    except WhisperError as exc:
+        return error_response(exc.code, exc.message)
+    finally:
+        jobs.schedule_cleanup(job["id"], delay=1)
+
+
+@app.post("/api/translate")
+async def api_translate(payload: dict) -> JSONResponse:
+    url = read_url(payload)
+    if not is_http_url(url):
+        return error_response("invalid_url", "请粘贴以 http 或 https 开头的视频链接")
+    blocked = await _require_llm()
+    if blocked:
+        return blocked
+
+    target = str(payload.get("target_lang") or "zh").strip().lower()
+    if target not in {"zh", "en"}:
+        target = "zh"
+
+    job = jobs.create_job()
+    try:
+        cues, _source = await run_in_threadpool(_load_cues, url, job["dir"])
+        text = cues_to_plain_text(cues)
+        if not text:
+            return error_response("whisper_failed", "语音转写没有得到可用文本")
+        result = await run_in_threadpool(ai_service.translate, text, target)
         return JSONResponse({"ok": True, "text": result})
     except YtdlpError as exc:
+        return error_response(exc.code, exc.message)
+    except WhisperError as exc:
         return error_response(exc.code, exc.message)
     except ai_service.LlmError as exc:
         return error_response(exc.code, exc.message)
@@ -190,14 +321,24 @@ async def _subtitle_then_llm(url: str, action: str, target_lang: str = "zh") -> 
         jobs.schedule_cleanup(job["id"], delay=1)
 
 
-@app.post("/api/summary")
-async def api_summary(payload: dict) -> JSONResponse:
-    return await _subtitle_then_llm(read_url(payload), "summary")
+@app.post("/api/ask")
+async def api_ask(payload: dict) -> JSONResponse:
+    blocked = await _require_llm()
+    if blocked:
+        return blocked
 
+    learn_id = str(payload.get("learn_id") or "").strip()
+    question = str(payload.get("question") or "").strip()
+    if not question:
+        return error_response("llm_failed", "请先输入要问的问题")
 
-@app.post("/api/translate")
-async def api_translate(payload: dict) -> JSONResponse:
-    target = str(payload.get("target_lang") or "zh").strip().lower()
-    if target not in {"zh", "en"}:
-        target = "zh"
-    return await _subtitle_then_llm(read_url(payload), "translate", target)
+    job = jobs.get_job(learn_id) if learn_id else None
+    cues = (job or {}).get("cues") if job else None
+    if not cues:
+        return error_response("learn_expired", "学习会话已过期，请重新点一次「AI 总结」")
+
+    try:
+        result = await run_in_threadpool(ai_service.ask, cues, question)
+        return JSONResponse({"ok": True, "text": result})
+    except ai_service.LlmError as exc:
+        return error_response(exc.code, exc.message)
